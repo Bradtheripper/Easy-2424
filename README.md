@@ -9,7 +9,7 @@ as a matching `24:24` thread appears.
 | Tuesday           | 08:27-08:32  | `24:24` + `Tuesday`         |
 | Wednesday         | 08:27-08:32  | `24:24` + `Wednesday`       |
 | Thursday          | 08:27-08:32  | `24:24` + `Thursday` / `Today` / `Weekend` |
-| Friday            | 08:27-08:32  | `24:24` + `Friday` / `Weekend` / `Today`   |
+| Friday            | 06:27-06:32  | `24:24` + `Friday` / `Weekend` / `Today`   |
 
 Multi-threaded inside the window: 3 workers polling every 2 s with staggered
 start offsets ≈ one HTTP request every ~0.67 s.

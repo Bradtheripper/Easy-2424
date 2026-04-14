@@ -9,7 +9,7 @@ email per product whenever a matching 24:24 thread appears:
   Wednesday 08:27-08:32 Beijing time  -> titles containing "24:24" + "Wednesday"
   Thursday  08:27-08:32 Beijing time  -> titles containing "24:24" + "Thursday"
                                          (or "Today" / "Weekend" variants)
-  Friday    08:27-08:32 Beijing time  -> titles containing "24:24" + "Friday"
+  Friday    06:27-06:32 Beijing time  -> titles containing "24:24" + "Friday"
                                          (or "Weekend" / "Today" variants)
 
 Usage:
@@ -52,10 +52,15 @@ FORUM_URL = (
 )
 BEIJING_TZ = timezone(timedelta(hours=8))
 
+# Per-weekday Beijing-time monitoring windows.
 # Python weekday(): Monday=0, Tuesday=1, ..., Sunday=6
-MONITOR_WEEKDAYS = {1, 2, 3, 4}  # Tue, Wed, Thu, Fri
-WINDOW_START = (8, 27, 0)
-WINDOW_END = (8, 32, 0)
+# Tue/Wed/Thu fire at 08:27-08:32; Friday fires one hour earlier at 06:27-06:32.
+WINDOWS = {
+    1: ((8, 27, 0), (8, 32, 0)),  # Tuesday
+    2: ((8, 27, 0), (8, 32, 0)),  # Wednesday
+    3: ((8, 27, 0), (8, 32, 0)),  # Thursday
+    4: ((6, 27, 0), (6, 32, 0)),  # Friday
+}
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -114,10 +119,10 @@ def today_keyword(now: Optional[datetime] = None) -> Optional[str]:
 
 def in_window(now: Optional[datetime] = None) -> bool:
     now = now or beijing_now()
-    if now.weekday() not in MONITOR_WEEKDAYS:
+    window = WINDOWS.get(now.weekday())
+    if not window:
         return False
-    sh, sm, ss = WINDOW_START
-    eh, em, es = WINDOW_END
+    (sh, sm, ss), (eh, em, es) = window
     start = now.replace(hour=sh, minute=sm, second=ss, microsecond=0)
     end = now.replace(hour=eh, minute=em, second=es, microsecond=0)
     return start <= now < end
@@ -126,13 +131,14 @@ def in_window(now: Optional[datetime] = None) -> bool:
 def seconds_until_next_window(now: Optional[datetime] = None) -> float:
     """Seconds from `now` to the next monitoring window start (Beijing time)."""
     now = now or beijing_now()
-    sh, sm, ss = WINDOW_START
     for offset in range(0, 8):
         d = (now + timedelta(days=offset)).date()
-        candidate = datetime(
-            d.year, d.month, d.day, sh, sm, ss, tzinfo=BEIJING_TZ
-        )
-        if candidate.weekday() in MONITOR_WEEKDAYS and candidate > now:
+        window = WINDOWS.get(d.weekday())
+        if not window:
+            continue
+        (sh, sm, ss), _ = window
+        candidate = datetime(d.year, d.month, d.day, sh, sm, ss, tzinfo=BEIJING_TZ)
+        if candidate > now:
             return max(0.0, (candidate - now).total_seconds())
     return 60.0
 
