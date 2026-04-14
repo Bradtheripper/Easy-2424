@@ -52,11 +52,16 @@ cigars:
   - "Hoyo De Monterrey San Juan"
 
 # How aggressively to poll while inside the monitoring window.
-# workers * interval determines effective request rate. 3 workers every 2s
-# ≈ one request every ~0.67s, which is plenty without being abusive.
-poll_workers: 3
-poll_interval_seconds: 2.0
-http_timeout_seconds: 10.0
+# workers * interval determines effective request rate. 6 workers every 1s
+# ≈ one request every ~167ms — tuned for the high-traffic 24:24 drop where
+# the forum page can take >1s and overlapping workers mask that latency.
+# The scraper pre-warms TCP/TLS at T-30s and SMTP login at T-10s before the
+# window opens, so the first in-window request skips handshakes. A raw-text
+# "24:24" substring pre-filter also skips BeautifulSoup parsing on the 99.9%
+# of polls that don't match.
+poll_workers: 6
+poll_interval_seconds: 1.0
+http_timeout_seconds: 3.0
 
 # File where already-alerted (thread_url, cigar) pairs are recorded so the
 # script never double-sends. Safe to delete to reset state.

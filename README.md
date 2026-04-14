@@ -13,10 +13,26 @@ the alert is based purely on the index title.
 | Thursday          | 08:27-08:32  | `24:24` + `Thursday` / `Today` / `Weekend` |
 | Friday            | 06:27-06:32  | `24:24` + `Friday` / `Weekend` / `Today`   |
 
-Multi-threaded inside the window: 3 workers polling every 2 s with staggered
-start offsets ≈ one HTTP request every ~0.67 s. All emails are sent under
-one SMTP login per match; sends are serialised so concurrent workers do not
-double-send.
+Multi-threaded inside the window: 6 workers polling every 1 s with staggered
+start offsets aligned to the window's top-of-second ≈ one HTTP request every
+~167 ms. Performance add-ons for the high-traffic drop:
+
+- **RSS-first**: prefers the forum's `.xml/` feed (lighter, parses much
+  faster than BeautifulSoup on the HTML page). Falls back to HTML
+  automatically if the feed is missing or returns non-XML.
+- **Raw-text pre-filter**: the body is scanned for the literal `24:24`
+  before any parsing, so off-cycle polls cost only a `str.find()`.
+- **HTTP pre-warm at T-30 s**: one fetch + RSS probe so the first
+  in-window request skips DNS / TLS / keep-alive cold start.
+- **SMTP pre-warm at T-10 s**: opens the SSL channel and runs AUTH LOGIN
+  against Gmail so the first order email is a plain `sendmail()` round-trip.
+- **Pre-built MIME**: one MIME byte blob per cigar is serialised at
+  startup; sends use `smtp.sendmail(from, to, bytes)` (no re-encoding).
+- **All-sent fast exit**: once every cigar for the matched thread is sent,
+  remaining workers stop immediately instead of burning out the window.
+
+All emails go out under a single persistent SMTP connection per window;
+sends are serialised by a lock so concurrent workers can't double-send.
 
 ## Setup
 
@@ -52,8 +68,9 @@ python monitor.py --now -v
 python monitor.py
 ```
 
-The process is long-running. It sleeps between windows and only spins up the
-worker pool inside 08:27-08:32 Beijing time on Tue-Fri.
+The process is long-running. It sleeps between windows, pre-warms HTTP at
+T-30 s and SMTP at T-10 s, then spins up the worker pool at the top of the
+window (08:27-08:32 Beijing time Tue-Thu, 06:27-06:32 Fri).
 
 ### systemd (example)
 
@@ -92,15 +109,19 @@ request addressed to Diana; edit `config.yaml` to personalise it.
 
 ## Notes
 
-- The scraper uses IPS-style selectors and falls back to any
-  `a[href*="/forum/topic/"]`, so small theme changes should not break it.
-- When a match is detected, all emails for that match are sent under a
-  single SMTP login (one connection, N messages) to minimise latency and
-  avoid tripping Gmail's per-connection throttles.
+- The scraper prefers the IPS RSS feed (`<forum-url>.xml/`) and falls back
+  to HTML with IPS-style selectors plus a generic `a[href*="/forum/topic/"]`
+  catch-all, so small theme changes should not break it.
+- When a match is detected, all emails for that match are sent through a
+  single pre-warmed SMTP connection (one login, N messages) to minimise
+  latency and avoid Gmail's per-connection throttles. A NOOP + lazy
+  reconnect guards against a dropped socket.
 - `dedup_state_path` records already-sent `(thread_url, cigar)` pairs. A
   cigar is marked "sent" only after SMTP returns success, so transient
   failures are retried on the next poll. Delete the file to reset.
 - Testing with `--now` will fire real emails — consider trimming `cigars:`
   or using a throwaway recipient before the first run.
-- Be mindful of the forum's rules and rate limits; the default poll rate
-  is already modest.
+- HTTP timeout is aggressive (3 s) with one fast retry; a single slow poll
+  won't eat the whole window.
+- Be mindful of the forum's rules and rate limits; ~167 ms between requests
+  is still well below human browsing cadence, but don't raise it further.

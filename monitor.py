@@ -28,18 +28,19 @@ import argparse
 import logging
 import os
 import smtplib
+import socket
 import ssl
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import requests
 import yaml
@@ -53,6 +54,9 @@ FORUM_URL = (
     "https://www.fohcigars.com/forum/"
     "forum/1-cigars-discussion-forum-quotthe-water-holequot/"
 )
+# IPS 4.x exposes an RSS feed at "<forum_url>.xml/". Much lighter than HTML.
+RSS_URL = FORUM_URL.rstrip("/") + ".xml/"
+
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 # Per-weekday Beijing-time monitoring windows.
@@ -64,6 +68,10 @@ WINDOWS = {
     3: ((8, 27, 0), (8, 32, 0)),  # Thursday
     4: ((6, 27, 0), (6, 32, 0)),  # Friday
 }
+
+# Pre-warm offsets (seconds before window start).
+HTTP_PREWARM_SECONDS = 30   # fetch forum once to warm TCP/TLS + probe RSS
+SMTP_PREWARM_SECONDS = 10   # open Gmail SMTP + AUTH LOGIN so first send is instant
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -96,9 +104,12 @@ class AppConfig:
     subject_template: str
     body_template: str
     cigars: List[str]
-    poll_workers: int = 3
-    poll_interval_seconds: float = 2.0
-    http_timeout_seconds: float = 10.0
+    # Tightened defaults for high-traffic windows: 6 workers staggered across a
+    # 1s interval (~167ms effective rate) and a 3s per-request timeout with one
+    # fast retry so a stuck request doesn't eat the window.
+    poll_workers: int = 6
+    poll_interval_seconds: float = 1.0
+    http_timeout_seconds: float = 3.0
     dedup_state_path: Path = field(default_factory=lambda: Path(".state/seen.txt"))
 
 
@@ -170,6 +181,9 @@ def title_matches(title: str, keyword: str) -> bool:
 # ---------------------------------------------------------------------------
 
 class ForumScraper:
+    """Fetches the forum index. Prefers the RSS feed (lighter, faster) when
+    the endpoint is reachable; falls back to parsing the HTML page."""
+
     def __init__(self, config: AppConfig) -> None:
         self.session = requests.Session()
         self.session.headers.update(
@@ -185,24 +199,125 @@ class ForumScraper:
             }
         )
         self.timeout = config.http_timeout_seconds
+        # None = not yet probed; True/False after warm_up() / first RSS attempt.
+        self._rss_works: Optional[bool] = None
+
+    # ---- low-level fetch ------------------------------------------------
 
     def fetch(self, url: str) -> Optional[str]:
-        try:
-            r = self.session.get(url, timeout=self.timeout)
-        except requests.RequestException as exc:
-            LOGGER.warning("GET %s failed: %s", url, exc)
-            return None
-        if r.status_code != 200:
+        """GET with one fast retry on network error; 3s-style timeout."""
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                r = self.session.get(url, timeout=self.timeout)
+            except (requests.RequestException, socket.timeout) as exc:
+                last_exc = exc
+                continue
+            if r.status_code == 200:
+                return r.text
             LOGGER.warning("GET %s -> HTTP %s", url, r.status_code)
             return None
-        return r.text
+        LOGGER.warning("GET %s failed after retry: %s", url, last_exc)
+        return None
+
+    # ---- warm-up / RSS probing -----------------------------------------
+
+    def warm_up(self) -> None:
+        """Pre-establish TCP/TLS to fohcigars and decide RSS vs HTML path.
+        Called once at T-30s before the window opens so the first in-window
+        request skips the DNS/TLS handshake."""
+        LOGGER.info("Pre-warm: probing RSS and warming HTTP connection")
+        self._probe_rss()
+        # Issue one HTML fetch too so both paths keep a warm keep-alive slot.
+        self.fetch(FORUM_URL)
+
+    def _probe_rss(self) -> bool:
+        try:
+            r = self.session.get(RSS_URL, timeout=self.timeout)
+        except (requests.RequestException, socket.timeout) as exc:
+            LOGGER.info("RSS probe: network error (%s); using HTML fallback", exc)
+            self._rss_works = False
+            return False
+        if r.status_code != 200:
+            LOGGER.info("RSS probe: HTTP %s; using HTML fallback", r.status_code)
+            self._rss_works = False
+            return False
+        if "<rss" not in r.text[:2048] and "<feed" not in r.text[:2048]:
+            LOGGER.info("RSS probe: unexpected body; using HTML fallback")
+            self._rss_works = False
+            return False
+        try:
+            ET.fromstring(r.text)
+        except ET.ParseError as exc:
+            LOGGER.info("RSS probe: parse error (%s); using HTML fallback", exc)
+            self._rss_works = False
+            return False
+        LOGGER.info("RSS probe: OK, using %s", RSS_URL)
+        self._rss_works = True
+        return True
+
+    # ---- thread listing -------------------------------------------------
 
     def list_threads(self) -> List[Thread]:
-        html = self.fetch(FORUM_URL)
-        if not html:
-            return []
-        soup = BeautifulSoup(html, "html.parser")
+        """Return current thread list using the preferred source.
 
+        A cheap substring pre-filter on the raw response skips full parsing
+        when no "24:24" appears anywhere on the page — which is ~99.9% of
+        polls.
+        """
+        if self._rss_works is None:
+            # First call without explicit warm-up: probe lazily.
+            self._probe_rss()
+
+        if self._rss_works:
+            body = self.fetch(RSS_URL)
+            if not body:
+                return []
+            if "24:24" not in body and "24\uff1a24" not in body:
+                return []
+            return self._parse_rss(body)
+
+        body = self.fetch(FORUM_URL)
+        if not body:
+            return []
+        if "24:24" not in body and "24\uff1a24" not in body:
+            return []
+        return self._parse_html(body)
+
+    # ---- parsers --------------------------------------------------------
+
+    def _parse_rss(self, xml_text: str) -> List[Thread]:
+        threads: List[Thread] = []
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as exc:
+            LOGGER.warning("RSS parse failed: %s (falling back to HTML)", exc)
+            self._rss_works = False
+            return []
+
+        # RSS 2.0 path: <rss><channel><item><title>/<link>
+        for item in root.iter("item"):
+            title_el = item.find("title")
+            link_el = item.find("link")
+            title = (title_el.text or "").strip() if title_el is not None else ""
+            url = (link_el.text or "").strip() if link_el is not None else ""
+            if title and url:
+                threads.append(Thread(title=title, url=url))
+
+        # Atom path (some IPS builds): <feed><entry><title>/<link href="...">
+        if not threads:
+            atom_ns = "{http://www.w3.org/2005/Atom}"
+            for entry in root.iter(atom_ns + "entry"):
+                title_el = entry.find(atom_ns + "title")
+                link_el = entry.find(atom_ns + "link")
+                title = (title_el.text or "").strip() if title_el is not None else ""
+                url = (link_el.get("href") or "").strip() if link_el is not None else ""
+                if title and url:
+                    threads.append(Thread(title=title, url=url))
+        return threads
+
+    def _parse_html(self, html: str) -> List[Thread]:
+        soup = BeautifulSoup(html, "html.parser")
         # Invision Power Suite (IPS) - several markups depending on version.
         selectors = (
             "li.ipsDataItem h4.ipsDataItem_title a",
@@ -240,69 +355,159 @@ class ForumScraper:
 # ---------------------------------------------------------------------------
 
 class Mailer:
-    """SMTP sender. `session()` opens one connection for many messages; all
-    sends are serialised by a single lock to avoid concurrent-send races."""
+    """SMTP sender with a reusable, pre-warmable connection.
+
+    - ``prewarm()`` opens the SSL/TLS channel and runs AUTH LOGIN *before* the
+      monitoring window so the first real send pays zero handshake cost.
+    - ``prebuild_bodies()`` pre-serialises one MIME byte blob per cigar so
+      ``send_order()`` only does a ``sendmail()`` round-trip on match.
+    - ``send_order()`` uses the pre-warmed connection under a single lock
+      (SMTP is not thread-safe) and transparently reconnects if the socket
+      died while waiting.
+    - ``close_prewarm()`` tears the connection down after the window.
+    """
+
+    # Drop the warm connection if it's been idle this long - Gmail boots
+    # sessions around ~10 minutes but we're paranoid because the whole point
+    # of pre-warm is *fresh* state going into the window.
+    _MAX_IDLE_SECONDS = 300.0
 
     def __init__(self, config: AppConfig) -> None:
         self.cfg = config
         self._lock = threading.Lock()
+        self._conn: Optional[smtplib.SMTP] = None
+        self._last_used: float = 0.0
+        self._prebuilt: Dict[str, bytes] = {}
+        self._from_addr = f'"{self.cfg.sender_name}" <{self.cfg.smtp_user}>'
+
+    # ---- connection management -----------------------------------------
 
     def _open(self) -> smtplib.SMTP:
         if self.cfg.smtp_use_ssl:
             context = ssl.create_default_context()
-            return smtplib.SMTP_SSL(
+            s = smtplib.SMTP_SSL(
                 self.cfg.smtp_host, self.cfg.smtp_port, context=context, timeout=15
             )
-        s = smtplib.SMTP(self.cfg.smtp_host, self.cfg.smtp_port, timeout=15)
-        s.ehlo()
-        s.starttls(context=ssl.create_default_context())
-        s.ehlo()
+        else:
+            s = smtplib.SMTP(self.cfg.smtp_host, self.cfg.smtp_port, timeout=15)
+            s.ehlo()
+            s.starttls(context=ssl.create_default_context())
+            s.ehlo()
+        s.login(self.cfg.smtp_user, self.cfg.smtp_password)
         return s
+
+    def _ensure_connection(self) -> smtplib.SMTP:
+        """Return a live, logged-in SMTP connection. Caller must hold _lock."""
+        if self._conn is not None:
+            idle = time.monotonic() - self._last_used
+            if idle < self._MAX_IDLE_SECONDS:
+                try:
+                    self._conn.noop()
+                    return self._conn
+                except (smtplib.SMTPException, OSError):
+                    LOGGER.info("SMTP NOOP failed, reopening connection")
+            else:
+                LOGGER.info("SMTP idle %.0fs, reopening connection", idle)
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+        LOGGER.debug("Opening SMTP connection to %s:%d",
+                     self.cfg.smtp_host, self.cfg.smtp_port)
+        self._conn = self._open()
+        return self._conn
+
+    def prewarm(self) -> None:
+        """Open + AUTH the SMTP connection ahead of the window (idempotent)."""
+        with self._lock:
+            if self._conn is not None:
+                return
+            LOGGER.info("Pre-warm: opening SMTP + AUTH LOGIN")
+            try:
+                self._conn = self._open()
+                self._last_used = time.monotonic()
+            except Exception:
+                LOGGER.exception("SMTP pre-warm failed (will retry on first send)")
+                self._conn = None
+
+    def close_prewarm(self) -> None:
+        """Close the pre-warmed connection (safe if none open)."""
+        with self._lock:
+            if self._conn is None:
+                return
+            try:
+                self._conn.quit()
+            except Exception:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            self._conn = None
+
+    # ---- message building ----------------------------------------------
 
     def _build(self, subject: str, body: str) -> MIMEMultipart:
         msg = MIMEMultipart()
-        msg["From"] = f'"{self.cfg.sender_name}" <{self.cfg.smtp_user}>'
+        msg["From"] = self._from_addr
         msg["To"] = ", ".join(self.cfg.recipients)
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain", "utf-8"))
         return msg
 
-    @contextmanager
-    def session(self):
-        """Open SMTP once, login once; yield a helper that sends individual
-        cigar order emails. Releases the connection on exit."""
+    def prebuild_bodies(self) -> None:
+        """Serialise one MIME byte blob per cigar once at startup."""
+        prebuilt: Dict[str, bytes] = {}
+        for cigar in self.cfg.cigars:
+            subject = self.cfg.subject_template.format(cigar=cigar)
+            body = self.cfg.body_template.format(cigar=cigar)
+            prebuilt[cigar] = self._build(subject, body).as_bytes()
+        self._prebuilt = prebuilt
+        LOGGER.info("Pre-built %d MIME messages", len(prebuilt))
+
+    # ---- sending -------------------------------------------------------
+
+    def send_order(self, cigar: str) -> str:
+        """Send one pre-built order email. Returns the subject on success."""
+        data = self._prebuilt.get(cigar)
+        subject = self.cfg.subject_template.format(cigar=cigar)
         with self._lock:
-            with self._open() as smtp:
-                smtp.login(self.cfg.smtp_user, self.cfg.smtp_password)
-                yield _MailSession(self, smtp)
+            smtp = self._ensure_connection()
+            try:
+                if data is not None:
+                    smtp.sendmail(self.cfg.smtp_user, self.cfg.recipients, data)
+                else:
+                    # Fallback if prebuild hasn't run (e.g. --test paths).
+                    body = self.cfg.body_template.format(cigar=cigar)
+                    smtp.send_message(self._build(subject, body))
+            except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError,
+                    OSError) as exc:
+                LOGGER.warning("SMTP send hit connection error (%s); retrying once", exc)
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+                smtp = self._ensure_connection()
+                if data is not None:
+                    smtp.sendmail(self.cfg.smtp_user, self.cfg.recipients, data)
+                else:
+                    body = self.cfg.body_template.format(cigar=cigar)
+                    smtp.send_message(self._build(subject, body))
+            self._last_used = time.monotonic()
+        return subject
 
     def send_test(self) -> None:
         with self._lock:
-            with self._open() as s:
-                s.login(self.cfg.smtp_user, self.cfg.smtp_password)
-                msg = self._build(
-                    "[24:24] SMTP test",
-                    f"Test email from monitor at Beijing time "
-                    f"{beijing_now():%Y-%m-%d %H:%M:%S}.\n",
-                )
-                s.send_message(msg)
+            smtp = self._ensure_connection()
+            msg = self._build(
+                "[24:24] SMTP test",
+                f"Test email from monitor at Beijing time "
+                f"{beijing_now():%Y-%m-%d %H:%M:%S}.\n",
+            )
+            smtp.send_message(msg)
+            self._last_used = time.monotonic()
         LOGGER.info("Test email sent to %s", ", ".join(self.cfg.recipients))
-
-
-class _MailSession:
-    """Helper yielded by `Mailer.session()`. Sends one email per cigar under
-    the active SMTP connection."""
-
-    def __init__(self, mailer: "Mailer", smtp: smtplib.SMTP) -> None:
-        self._mailer = mailer
-        self._smtp = smtp
-
-    def send_order(self, cigar: str) -> str:
-        cfg = self._mailer.cfg
-        subject = cfg.subject_template.format(cigar=cigar)
-        body = cfg.body_template.format(cigar=cigar)
-        self._smtp.send_message(self._mailer._build(subject, body))
-        return subject
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +548,7 @@ class Monitor:
         self.cfg = config
         self.scraper = ForumScraper(config)
         self.mailer = Mailer(config)
+        self.mailer.prebuild_bodies()
         # One seen-store keyed by "<thread_url>::<cigar_lower>". A cigar is
         # marked seen only after its email is successfully delivered, so
         # transient SMTP failures are retried on the next poll.
@@ -350,6 +556,9 @@ class Monitor:
         self._logged_matches: Set[str] = set()
         self._logged_matches_lock = threading.Lock()
         self.stop_event = threading.Event()
+        # Signalled once every cigar for a matched thread has been sent, so
+        # workers can exit the poll loop early instead of burning the window.
+        self.all_sent_event = threading.Event()
 
     # ---- helpers ---------------------------------------------------------
 
@@ -390,60 +599,109 @@ class Monitor:
                     worker_id, thread.title, len(outstanding), thread.url,
                 )
 
-        # Batch all emails under one SMTP login. The Mailer serialises
-        # sessions so concurrent workers queue up rather than racing.
-        try:
-            with self.mailer.session() as session:
-                for cigar in outstanding:
-                    key = self._key(thread.url, cigar)
-                    # Recheck inside the SMTP lock: another worker may have
-                    # sent this cigar while we were waiting for the lock.
-                    if self.seen.contains(key):
-                        continue
-                    try:
-                        subject = session.send_order(cigar)
-                    except smtplib.SMTPException:
-                        LOGGER.exception("Failed to send order for %s", cigar)
-                        continue
-                    self.seen.add(key)
-                    LOGGER.info("Emailed: %s", subject)
-        except Exception:
-            LOGGER.exception("SMTP session failed for %s", thread.url)
+        # Mailer.send_order() serialises sends on its own lock and reuses the
+        # pre-warmed connection, so we can call it directly per cigar.
+        for cigar in outstanding:
+            key = self._key(thread.url, cigar)
+            # Recheck in case another worker already sent this one.
+            if self.seen.contains(key):
+                continue
+            try:
+                subject = self.mailer.send_order(cigar)
+            except smtplib.SMTPException:
+                LOGGER.exception("Failed to send order for %s", cigar)
+                continue
+            except Exception:
+                LOGGER.exception("Unexpected error sending order for %s", cigar)
+                continue
+            self.seen.add(key)
+            LOGGER.info("Emailed: %s", subject)
+
+        # If every cigar for this thread is now sent, tell workers to stop.
+        remaining = [
+            c for c in self.cfg.cigars
+            if not self.seen.contains(self._key(thread.url, c))
+        ]
+        if not remaining:
+            self.all_sent_event.set()
 
     # ---- worker threads --------------------------------------------------
 
-    def _worker(self, worker_id: int, offset: float) -> None:
-        if offset:
-            self.stop_event.wait(offset)
-        while not self.stop_event.is_set() and in_window():
+    def _should_stop(self) -> bool:
+        return (
+            self.stop_event.is_set()
+            or self.all_sent_event.is_set()
+            or not in_window()
+        )
+
+    def _worker(self, worker_id: int, start_at: float) -> None:
+        """Poll in a loop until the window closes or all cigars are sent.
+
+        ``start_at`` is an absolute ``time.monotonic()`` timestamp — workers
+        line up against the true window boundary (not "now + offset") so the
+        first batch of polls fires at the top of the window.
+        """
+        delay = max(0.0, start_at - time.monotonic())
+        if delay:
+            if self.stop_event.wait(delay):
+                return
+        while not self._should_stop():
             start = time.monotonic()
             try:
                 self._poll_once(worker_id)
             except Exception:
                 LOGGER.exception("Poll error in worker %d", worker_id)
+            if self._should_stop():
+                return
             elapsed = time.monotonic() - start
             wait = max(0.0, self.cfg.poll_interval_seconds - elapsed)
             if wait:
-                self.stop_event.wait(wait)
+                # Wake on either stop signal OR all-sent signal.
+                if self.stop_event.wait(wait):
+                    return
+                if self.all_sent_event.is_set():
+                    return
+
+    def _window_start_monotonic(self) -> float:
+        """Monotonic timestamp corresponding to today's window open time.
+        If we're already inside the window, returns ``now`` (start immediately).
+        """
+        now = beijing_now()
+        window = WINDOWS.get(now.weekday())
+        if not window:
+            return time.monotonic()
+        (sh, sm, ss), _ = window
+        start_dt = now.replace(hour=sh, minute=sm, second=ss, microsecond=0)
+        delta = (start_dt - now).total_seconds()
+        return time.monotonic() + max(0.0, delta)
 
     def run_window(self) -> None:
         LOGGER.info("Entering monitor window at %s", beijing_now())
+        self.all_sent_event.clear()
         workers = max(1, self.cfg.poll_workers)
         stagger = self.cfg.poll_interval_seconds / workers
+        window_start = self._window_start_monotonic()
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [
-                ex.submit(self._worker, i, stagger * i) for i in range(workers)
+                ex.submit(self._worker, i, window_start + stagger * i)
+                for i in range(workers)
             ]
             for f in futures:
                 f.result()
         LOGGER.info("Exited monitor window at %s", beijing_now())
+        # Close the pre-warmed SMTP so we don't hold a Gmail session for hours.
+        self.mailer.close_prewarm()
 
     def run_forever(self) -> None:
         LOGGER.info("Monitor started. Beijing time: %s", beijing_now())
+        http_warmed = False
+        smtp_warmed = False
         try:
             while not self.stop_event.is_set():
                 if in_window():
                     self.run_window()
+                    http_warmed = False
+                    smtp_warmed = False
                     continue
                 wait = seconds_until_next_window()
                 LOGGER.info(
@@ -453,14 +711,34 @@ class Monitor:
                         "%a %Y-%m-%d %H:%M:%S"
                     ),
                 )
-                # Sleep in chunks so the loop stays responsive.
+                # Sleep in chunks so pre-warm checkpoints fire on time.
                 while wait > 0 and not self.stop_event.is_set():
-                    chunk = min(wait, 30.0)
+                    if not http_warmed and wait <= HTTP_PREWARM_SECONDS:
+                        try:
+                            self.scraper.warm_up()
+                        except Exception:
+                            LOGGER.exception("HTTP pre-warm failed")
+                        http_warmed = True
+                    if not smtp_warmed and wait <= SMTP_PREWARM_SECONDS:
+                        try:
+                            self.mailer.prewarm()
+                        except Exception:
+                            LOGGER.exception("SMTP pre-warm failed")
+                        smtp_warmed = True
+                    # Choose chunk size to hit the next prewarm boundary.
+                    next_boundary = 30.0
+                    if not http_warmed and wait > HTTP_PREWARM_SECONDS:
+                        next_boundary = min(next_boundary, wait - HTTP_PREWARM_SECONDS)
+                    if not smtp_warmed and wait > SMTP_PREWARM_SECONDS:
+                        next_boundary = min(next_boundary, wait - SMTP_PREWARM_SECONDS)
+                    chunk = max(0.1, min(wait, next_boundary))
                     self.stop_event.wait(chunk)
                     wait -= chunk
         except KeyboardInterrupt:
             LOGGER.info("Interrupted; shutting down.")
             self.stop_event.set()
+        finally:
+            self.mailer.close_prewarm()
 
 
 # ---------------------------------------------------------------------------
@@ -505,9 +783,9 @@ def load_config(path: Path) -> AppConfig:
         subject_template=subject_template,
         body_template=body_template,
         cigars=list(cigars),
-        poll_workers=int(data.get("poll_workers", 3)),
-        poll_interval_seconds=float(data.get("poll_interval_seconds", 2.0)),
-        http_timeout_seconds=float(data.get("http_timeout_seconds", 10.0)),
+        poll_workers=int(data.get("poll_workers", 6)),
+        poll_interval_seconds=float(data.get("poll_interval_seconds", 1.0)),
+        http_timeout_seconds=float(data.get("http_timeout_seconds", 3.0)),
         dedup_state_path=state_path,
     )
 
@@ -550,13 +828,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         LOGGER.info("One-shot poll (window check bypassed)")
         keyword = today_keyword() or "tuesday"
         LOGGER.info("Today keyword: %s", keyword)
-        threads = monitor.scraper.list_threads()
-        LOGGER.info("Fetched %d threads", len(threads))
-        for t in threads[:10]:
-            LOGGER.info("  - %s", t.title)
-        for t in threads:
-            if title_matches(t.title, keyword):
-                monitor._handle_thread(t, worker_id=0)
+        try:
+            threads = monitor.scraper.list_threads()
+            LOGGER.info("Fetched %d threads", len(threads))
+            for t in threads[:10]:
+                LOGGER.info("  - %s", t.title)
+            for t in threads:
+                if title_matches(t.title, keyword):
+                    monitor._handle_thread(t, worker_id=0)
+        finally:
+            monitor.mailer.close_prewarm()
         return 0
 
     monitor.run_forever()
