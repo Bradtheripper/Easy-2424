@@ -167,6 +167,64 @@ def title_matches(title: str, keyword: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Product parsing
+# ---------------------------------------------------------------------------
+
+# A price line starts with a packaging keyword and carries "$NNN USD". The
+# packaging prefix is what distinguishes a real price from the shipping-policy
+# line "Orders under $100 USD ...".
+_PRICE_LINE_RE = re.compile(
+    r"^\s*(?:"
+    r"Box|Tin|Jar|Pack|Cabinet|Bundle|SLB|Slide\s*Lid|Dress\s*Box|"
+    r"Half\s*Box|\u00bd\s*Box|5\s*[- ]?(?:pk|Pack)|10\s*[- ]?(?:pk|Pack)"
+    r")\b[^$]*?\$\s*(\d{1,5}(?:[.,]\d{2})?)\s*(?:USD)?\b",
+    re.IGNORECASE,
+)
+
+# A product title contains a parenthesised quantity marker. The enumerated
+# suffixes (pk / pack / 's / Tin N / Jar N / Box of N / Cabinet of N) keep us
+# from false-matching on vitola dimensions like "(5\u00bd")".
+_TITLE_LINE_RE = re.compile(
+    r"\(\s*(?:"
+    r"\d+\s*['\u2019]s"                    # (25's)  — both ASCII and curly apostrophe
+    r"|\d+\s*[- ]?\s*(?:pk|pack)"          # (5pk) (5 Pack) (5-pack)
+    r"|Tin\s*\d+"                          # (Tin 10)
+    r"|Jar\s*(?:of\s*)?\d+"                # (Jar 50) (Jar of 50)
+    r"|Box\s*of\s*\d+"                     # (Box of 25)
+    r"|Cabinet\s*(?:of\s*)?\d+"            # (Cabinet of 50)
+    r"|Bundle\s*(?:of\s*)?\d+"             # (Bundle 25)
+    r")\s*\)",
+    re.IGNORECASE,
+)
+
+
+def parse_products_from_lines(lines: List[str]) -> List[Product]:
+    """Scan post lines top-to-bottom; emit one Product per price line.
+
+    Each price line is attributed to the most recent preceding title line.
+    """
+    products: List[Product] = []
+    seen_keys: Set[str] = set()
+    last_title: Optional[str] = None
+
+    for line in lines:
+        pm = _PRICE_LINE_RE.match(line)
+        if pm and last_title:
+            key = last_title.lower()
+            if key not in seen_keys:
+                seen_keys.add(key)
+                price = f"${pm.group(1)} USD"
+                products.append(
+                    Product(name=last_title, price=price, raw_line=line)
+                )
+            last_title = None
+            continue
+        if _TITLE_LINE_RE.search(line):
+            last_title = line
+    return products
+
+
+# ---------------------------------------------------------------------------
 # Scraper
 # ---------------------------------------------------------------------------
 
@@ -246,38 +304,9 @@ class ForumScraper:
             or soup.select_one("article")
             or soup
         )
-
-        # Gather candidate lines: structural elements first, then raw lines.
-        raw_lines: List[str] = []
-        for el in body.find_all(["li", "p", "tr", "div"]):
-            text = el.get_text(" ", strip=True)
-            if text and text not in raw_lines:
-                raw_lines.append(text)
-        if not raw_lines:
-            raw_lines = [
-                ln.strip()
-                for ln in body.get_text("\n").splitlines()
-                if ln.strip()
-            ]
-
-        price_re = re.compile(r"(\$\s?\d{1,4}(?:[.,]\d{2})?)")
-        products: List[Product] = []
-        seen_names: Set[str] = set()
-        for raw in raw_lines:
-            m = price_re.search(raw)
-            if not m:
-                continue
-            price = m.group(1).replace(" ", "")
-            before = price_re.split(raw, maxsplit=1)[0]
-            name = re.sub(r"[\s\-\u2013\u2014:|]+$", "", before).strip()
-            if not name:
-                continue
-            key = name.lower()
-            if key in seen_names:
-                continue
-            seen_names.add(key)
-            products.append(Product(name=name, price=price, raw_line=raw))
-        return products
+        text = body.get_text("\n", strip=True)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        return parse_products_from_lines(lines)
 
 
 # ---------------------------------------------------------------------------
