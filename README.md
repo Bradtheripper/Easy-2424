@@ -1,8 +1,10 @@
 # FOHCigars 24:24 Monitor
 
 Watches `https://www.fohcigars.com/forum/forum/1-cigars-discussion-forum-quotthe-water-holequot/`
-during the Beijing-time windows below and emails one alert per product as soon
-as a matching `24:24` thread appears.
+during the Beijing-time windows below. As soon as a matching `24:24` thread
+is detected on the forum index, sends one order email per cigar from a fixed
+list using a configurable template. **Thread contents are not fetched** —
+the alert is based purely on the index title.
 
 | Weekday (Beijing) | Window       | Title must contain          |
 | ----------------- | ------------ | --------------------------- |
@@ -12,7 +14,9 @@ as a matching `24:24` thread appears.
 | Friday            | 06:27-06:32  | `24:24` + `Friday` / `Weekend` / `Today`   |
 
 Multi-threaded inside the window: 3 workers polling every 2 s with staggered
-start offsets ≈ one HTTP request every ~0.67 s.
+start offsets ≈ one HTTP request every ~0.67 s. All emails are sent under
+one SMTP login per match; sends are serialised so concurrent workers do not
+double-send.
 
 ## Setup
 
@@ -77,15 +81,26 @@ sudo systemctl enable --now fohc24
 journalctl -u fohc24 -f
 ```
 
+## Email template
+
+`subject_template` and `body_template` in `config.yaml` both support the
+`{cigar}` placeholder. Each cigar in the `cigars:` list triggers one email
+per matching thread, with `{cigar}` substituted by its name.
+
+Default subject: `24:24 <cigar-name>`. Default body is a ready-to-send order
+request addressed to Diana; edit `config.yaml` to personalise it.
+
 ## Notes
 
-- The server uses Invision Power Suite (IPS). The scraper tries a few CSS
-  selectors and falls back to any `a[href*="/forum/topic/"]`, so small theme
-  changes should not break it.
-- Product parsing looks for lines containing a `$XX.XX` price in the first
-  post and takes the text before the price as the product name. If parsing
-  fails, one fallback email is sent that links to the thread.
-- `dedup_state_path` records already-sent thread URLs and product keys. Delete
-  the file to reset (e.g. if you want to re-test against an old thread).
-- Be mindful of the forum's rules and rate limits; the default poll rate is
-  already modest.
+- The scraper uses IPS-style selectors and falls back to any
+  `a[href*="/forum/topic/"]`, so small theme changes should not break it.
+- When a match is detected, all emails for that match are sent under a
+  single SMTP login (one connection, N messages) to minimise latency and
+  avoid tripping Gmail's per-connection throttles.
+- `dedup_state_path` records already-sent `(thread_url, cigar)` pairs. A
+  cigar is marked "sent" only after SMTP returns success, so transient
+  failures are retried on the next poll. Delete the file to reset.
+- Testing with `--now` will fire real emails — consider trimming `cigars:`
+  or using a throwaway recipient before the first run.
+- Be mindful of the forum's rules and rate limits; the default poll rate
+  is already modest.

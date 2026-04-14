@@ -2,18 +2,21 @@
 """
 FOHCigars 24:24 Forum Monitor.
 
-Monitors the "Water Hole" sub-forum during Beijing-time windows and sends an
-email per product whenever a matching 24:24 thread appears:
+Monitors the "Water Hole" sub-forum during Beijing-time windows and, as soon
+as a matching 24:24 thread appears on the index, sends one order email per
+cigar from a fixed list using a configurable body template. Thread contents
+are NOT fetched; matching is done purely on the index title.
 
-  Tuesday   08:27-08:32 Beijing time  -> titles containing "24:24" + "Tuesday"
-  Wednesday 08:27-08:32 Beijing time  -> titles containing "24:24" + "Wednesday"
-  Thursday  08:27-08:32 Beijing time  -> titles containing "24:24" + "Thursday"
-                                         (or "Today" / "Weekend" variants)
-  Friday    06:27-06:32 Beijing time  -> titles containing "24:24" + "Friday"
-                                         (or "Weekend" / "Today" variants)
+Monitoring windows (Beijing time):
+  Tuesday   08:27-08:32  -> titles containing "24:24" + "Tuesday"
+  Wednesday 08:27-08:32  -> titles containing "24:24" + "Wednesday"
+  Thursday  08:27-08:32  -> titles containing "24:24" + "Thursday"
+                            (or "Today" / "Weekend" variants)
+  Friday    06:27-06:32  -> titles containing "24:24" + "Friday"
+                            (or "Weekend" / "Today" variants)
 
 Usage:
-    cp config.example.yaml config.yaml   # fill in SMTP + recipients
+    cp config.example.yaml config.yaml   # fill in SMTP, recipients, cigars
     python monitor.py                    # long-running loop
     python monitor.py --now              # do one poll immediately (for testing)
     python monitor.py --test-email       # send a dummy email to verify SMTP
@@ -24,13 +27,13 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import re
 import smtplib
 import ssl
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
@@ -82,13 +85,6 @@ class Thread:
 
 
 @dataclass
-class Product:
-    name: str
-    price: str
-    raw_line: str
-
-
-@dataclass
 class AppConfig:
     smtp_host: str
     smtp_port: int
@@ -97,6 +93,9 @@ class AppConfig:
     smtp_use_ssl: bool
     sender_name: str
     recipients: List[str]
+    subject_template: str
+    body_template: str
+    cigars: List[str]
     poll_workers: int = 3
     poll_interval_seconds: float = 2.0
     http_timeout_seconds: float = 10.0
@@ -164,64 +163,6 @@ def title_matches(title: str, keyword: str) -> bool:
         return False
     variants = _DAY_VARIANTS.get(keyword, (keyword,))
     return any(v in t for v in variants)
-
-
-# ---------------------------------------------------------------------------
-# Product parsing
-# ---------------------------------------------------------------------------
-
-# A price line starts with a packaging keyword and carries "$NNN USD". The
-# packaging prefix is what distinguishes a real price from the shipping-policy
-# line "Orders under $100 USD ...".
-_PRICE_LINE_RE = re.compile(
-    r"^\s*(?:"
-    r"Box|Tin|Jar|Pack|Cabinet|Bundle|SLB|Slide\s*Lid|Dress\s*Box|"
-    r"Half\s*Box|\u00bd\s*Box|5\s*[- ]?(?:pk|Pack)|10\s*[- ]?(?:pk|Pack)"
-    r")\b[^$]*?\$\s*(\d{1,5}(?:[.,]\d{2})?)\s*(?:USD)?\b",
-    re.IGNORECASE,
-)
-
-# A product title contains a parenthesised quantity marker. The enumerated
-# suffixes (pk / pack / 's / Tin N / Jar N / Box of N / Cabinet of N) keep us
-# from false-matching on vitola dimensions like "(5\u00bd")".
-_TITLE_LINE_RE = re.compile(
-    r"\(\s*(?:"
-    r"\d+\s*['\u2019]s"                    # (25's)  — both ASCII and curly apostrophe
-    r"|\d+\s*[- ]?\s*(?:pk|pack)"          # (5pk) (5 Pack) (5-pack)
-    r"|Tin\s*\d+"                          # (Tin 10)
-    r"|Jar\s*(?:of\s*)?\d+"                # (Jar 50) (Jar of 50)
-    r"|Box\s*of\s*\d+"                     # (Box of 25)
-    r"|Cabinet\s*(?:of\s*)?\d+"            # (Cabinet of 50)
-    r"|Bundle\s*(?:of\s*)?\d+"             # (Bundle 25)
-    r")\s*\)",
-    re.IGNORECASE,
-)
-
-
-def parse_products_from_lines(lines: List[str]) -> List[Product]:
-    """Scan post lines top-to-bottom; emit one Product per price line.
-
-    Each price line is attributed to the most recent preceding title line.
-    """
-    products: List[Product] = []
-    seen_keys: Set[str] = set()
-    last_title: Optional[str] = None
-
-    for line in lines:
-        pm = _PRICE_LINE_RE.match(line)
-        if pm and last_title:
-            key = last_title.lower()
-            if key not in seen_keys:
-                seen_keys.add(key)
-                price = f"${pm.group(1)} USD"
-                products.append(
-                    Product(name=last_title, price=price, raw_line=line)
-                )
-            last_title = None
-            continue
-        if _TITLE_LINE_RE.search(line):
-            last_title = line
-    return products
 
 
 # ---------------------------------------------------------------------------
@@ -293,29 +234,18 @@ class ForumScraper:
             threads.append(Thread(title=title, url=href))
         return threads
 
-    def extract_products(self, thread_url: str) -> List[Product]:
-        html = self.fetch(thread_url)
-        if not html:
-            return []
-        soup = BeautifulSoup(html, "html.parser")
-        body = (
-            soup.select_one('[data-role="commentContent"]')
-            or soup.select_one(".cPost_contentWrap")
-            or soup.select_one("article")
-            or soup
-        )
-        text = body.get_text("\n", strip=True)
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        return parse_products_from_lines(lines)
-
 
 # ---------------------------------------------------------------------------
 # Mailer
 # ---------------------------------------------------------------------------
 
 class Mailer:
+    """SMTP sender. `session()` opens one connection for many messages; all
+    sends are serialised by a single lock to avoid concurrent-send races."""
+
     def __init__(self, config: AppConfig) -> None:
         self.cfg = config
+        self._lock = threading.Lock()
 
     def _open(self) -> smtplib.SMTP:
         if self.cfg.smtp_use_ssl:
@@ -329,36 +259,50 @@ class Mailer:
         s.ehlo()
         return s
 
-    def _send(self, subject: str, body: str) -> None:
+    def _build(self, subject: str, body: str) -> MIMEMultipart:
         msg = MIMEMultipart()
         msg["From"] = f'"{self.cfg.sender_name}" <{self.cfg.smtp_user}>'
         msg["To"] = ", ".join(self.cfg.recipients)
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain", "utf-8"))
-        with self._open() as s:
-            s.login(self.cfg.smtp_user, self.cfg.smtp_password)
-            s.send_message(msg)
+        return msg
 
-    def send_product_alert(self, product: Product, thread: Thread) -> None:
-        subject = f"[24:24] {product.name} - {product.price}"
-        body = (
-            f"Thread : {thread.title}\n"
-            f"URL    : {thread.url}\n"
-            f"\n"
-            f"Product: {product.name}\n"
-            f"Price  : {product.price}\n"
-            f"\n"
-            f"Raw line:\n{product.raw_line}\n"
-        )
-        self._send(subject, body)
-        LOGGER.info("Emailed: %s", subject)
+    @contextmanager
+    def session(self):
+        """Open SMTP once, login once; yield a helper that sends individual
+        cigar order emails. Releases the connection on exit."""
+        with self._lock:
+            with self._open() as smtp:
+                smtp.login(self.cfg.smtp_user, self.cfg.smtp_password)
+                yield _MailSession(self, smtp)
 
     def send_test(self) -> None:
-        self._send(
-            "[24:24] SMTP test",
-            f"Test email from monitor at Beijing time {beijing_now():%Y-%m-%d %H:%M:%S}.\n",
-        )
+        with self._lock:
+            with self._open() as s:
+                s.login(self.cfg.smtp_user, self.cfg.smtp_password)
+                msg = self._build(
+                    "[24:24] SMTP test",
+                    f"Test email from monitor at Beijing time "
+                    f"{beijing_now():%Y-%m-%d %H:%M:%S}.\n",
+                )
+                s.send_message(msg)
         LOGGER.info("Test email sent to %s", ", ".join(self.cfg.recipients))
+
+
+class _MailSession:
+    """Helper yielded by `Mailer.session()`. Sends one email per cigar under
+    the active SMTP connection."""
+
+    def __init__(self, mailer: "Mailer", smtp: smtplib.SMTP) -> None:
+        self._mailer = mailer
+        self._smtp = smtp
+
+    def send_order(self, cigar: str) -> str:
+        cfg = self._mailer.cfg
+        subject = cfg.subject_template.format(cigar=cigar)
+        body = cfg.body_template.format(cigar=cigar)
+        self._smtp.send_message(self._mailer._build(subject, body))
+        return subject
 
 
 # ---------------------------------------------------------------------------
@@ -377,14 +321,17 @@ class SeenStore:
             with path.open("r", encoding="utf-8") as f:
                 self._data = {ln.strip() for ln in f if ln.strip()}
 
-    def add_if_new(self, key: str) -> bool:
+    def contains(self, key: str) -> bool:
+        with self._lock:
+            return key in self._data
+
+    def add(self, key: str) -> None:
         with self._lock:
             if key in self._data:
-                return False
+                return
             self._data.add(key)
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(key + "\n")
-            return True
 
 
 # ---------------------------------------------------------------------------
@@ -396,11 +343,19 @@ class Monitor:
         self.cfg = config
         self.scraper = ForumScraper(config)
         self.mailer = Mailer(config)
-        self.seen_threads = SeenStore(config.dedup_state_path)
-        self.seen_products = SeenStore(
-            config.dedup_state_path.with_name("seen_products.txt")
-        )
+        # One seen-store keyed by "<thread_url>::<cigar_lower>". A cigar is
+        # marked seen only after its email is successfully delivered, so
+        # transient SMTP failures are retried on the next poll.
+        self.seen = SeenStore(config.dedup_state_path)
+        self._logged_matches: Set[str] = set()
+        self._logged_matches_lock = threading.Lock()
         self.stop_event = threading.Event()
+
+    # ---- helpers ---------------------------------------------------------
+
+    @staticmethod
+    def _key(url: str, cigar: str) -> str:
+        return f"{url}::{cigar.lower()}"
 
     # ---- polling ---------------------------------------------------------
 
@@ -413,36 +368,47 @@ class Monitor:
         for t in threads:
             if not title_matches(t.title, keyword):
                 continue
-            if not self.seen_threads.add_if_new(t.url):
-                continue
-            LOGGER.info("[w%d] MATCH: %s -> %s", worker_id, t.title, t.url)
             try:
-                self._handle_thread(t)
+                self._handle_thread(t, worker_id)
             except Exception:
                 LOGGER.exception("Error handling thread %s", t.url)
 
-    def _handle_thread(self, thread: Thread) -> None:
-        products = self.scraper.extract_products(thread.url)
-        if not products:
-            LOGGER.warning("No products parsed from %s", thread.url)
-            # Still notify so the user is aware
-            fallback = Product(
-                name="(see thread)", price="?", raw_line="(unable to parse products)"
-            )
-            try:
-                self.mailer.send_product_alert(fallback, thread)
-            except Exception:
-                LOGGER.exception("Failed to send fallback email")
+    def _handle_thread(self, thread: Thread, worker_id: int) -> None:
+        # Cheap pre-check outside the SMTP lock: any cigar left to send?
+        outstanding = [
+            c for c in self.cfg.cigars
+            if not self.seen.contains(self._key(thread.url, c))
+        ]
+        if not outstanding:
             return
-        LOGGER.info("Parsed %d products from %s", len(products), thread.url)
-        for p in products:
-            key = f"{thread.url}::{p.name.lower()}"
-            if not self.seen_products.add_if_new(key):
-                continue
-            try:
-                self.mailer.send_product_alert(p, thread)
-            except Exception:
-                LOGGER.exception("Failed to send email for %s", p.name)
+
+        with self._logged_matches_lock:
+            if thread.url not in self._logged_matches:
+                self._logged_matches.add(thread.url)
+                LOGGER.info(
+                    "[w%d] MATCH: %s (%d emails to send) -> %s",
+                    worker_id, thread.title, len(outstanding), thread.url,
+                )
+
+        # Batch all emails under one SMTP login. The Mailer serialises
+        # sessions so concurrent workers queue up rather than racing.
+        try:
+            with self.mailer.session() as session:
+                for cigar in outstanding:
+                    key = self._key(thread.url, cigar)
+                    # Recheck inside the SMTP lock: another worker may have
+                    # sent this cigar while we were waiting for the lock.
+                    if self.seen.contains(key):
+                        continue
+                    try:
+                        subject = session.send_order(cigar)
+                    except smtplib.SMTPException:
+                        LOGGER.exception("Failed to send order for %s", cigar)
+                        continue
+                    self.seen.add(key)
+                    LOGGER.info("Emailed: %s", subject)
+        except Exception:
+            LOGGER.exception("SMTP session failed for %s", thread.url)
 
     # ---- worker threads --------------------------------------------------
 
@@ -510,10 +476,22 @@ def load_config(path: Path) -> AppConfig:
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     smtp = data.get("smtp") or {}
     recipients = data.get("recipients") or []
+    cigars = data.get("cigars") or []
+    subject_template = data.get("subject_template", "24:24 {cigar}")
+    body_template = data.get("body_template")
+
     if not smtp.get("user") or not smtp.get("password"):
         raise SystemExit("config.yaml: smtp.user and smtp.password are required.")
     if not recipients:
         raise SystemExit("config.yaml: at least one recipient is required.")
+    if not cigars:
+        raise SystemExit("config.yaml: the `cigars` list is empty.")
+    if not body_template:
+        raise SystemExit("config.yaml: `body_template` is required.")
+    if "{cigar}" not in body_template:
+        raise SystemExit(
+            "config.yaml: body_template must contain the `{cigar}` placeholder."
+        )
 
     state_path = Path(data.get("dedup_state_path", ".state/seen.txt"))
     return AppConfig(
@@ -524,6 +502,9 @@ def load_config(path: Path) -> AppConfig:
         smtp_use_ssl=bool(smtp.get("use_ssl", True)),
         sender_name=smtp.get("sender_name", "FOHC 24:24 Monitor"),
         recipients=list(recipients),
+        subject_template=subject_template,
+        body_template=body_template,
+        cigars=list(cigars),
         poll_workers=int(data.get("poll_workers", 3)),
         poll_interval_seconds=float(data.get("poll_interval_seconds", 2.0)),
         http_timeout_seconds=float(data.get("http_timeout_seconds", 10.0)),
@@ -575,8 +556,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             LOGGER.info("  - %s", t.title)
         for t in threads:
             if title_matches(t.title, keyword):
-                LOGGER.info("MATCH: %s -> %s", t.title, t.url)
-                monitor._handle_thread(t)
+                monitor._handle_thread(t, worker_id=0)
         return 0
 
     monitor.run_forever()

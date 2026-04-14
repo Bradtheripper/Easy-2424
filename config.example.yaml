@@ -10,17 +10,54 @@ smtp:
   password: "your-16-char-app-password"
   sender_name: "FOHC 24:24 Monitor"
 
-# One or more destination inboxes.
+# One or more destination inboxes. A separate email is sent per cigar to ALL
+# addresses listed here.
 recipients:
-  - "target@example.com"
+  - "diana@example.com"
 
-# How aggressively to poll while inside the 08:27-08:32 Beijing-time window.
+# Subject line template. {cigar} is substituted with each entry from `cigars`.
+subject_template: "24:24 {cigar}"
+
+# Body template. {cigar} is substituted with each entry from `cigars`.
+# The leading `|` preserves newlines in YAML.
+body_template: |
+  Dear Diana,
+  Full Name: Brad Ke
+  Forum Handle: Bradtheripper
+  Country: China
+  State: Guangxi Province
+  I would like to have a box of {cigar}
+  Can you please place the order for me?
+  Many Thanks,
+  Ronghao Ke
+
+# When a matching 24:24 thread is detected, one email is sent for each cigar
+# below (16 emails by default). Order is preserved in the sending loop.
+cigars:
+  - "Montecristo Edmundo"
+  - "Montecristo Petit Edmundo"
+  - "Ramon Allones Specially Select"
+  - "Bolivar Belicoso Finos"
+  - "Bolivar Royal Corona"
+  - "Diplomaticos number 2"
+  - "H.Upmann Magnum 50"
+  - "H.Upmann Magnum 46"
+  - "Juan Lopez seleccion number 2"
+  - "Romeo y Julieta Wide Churchill"
+  - "Quai d'Orsay No.50"
+  - "Punch Punch"
+  - "Partagas Serie D number 4"
+  - "Partagas Serie D number 5"
+  - "Partagas Serie P number 2"
+  - "Hoyo De Monterrey San Juan"
+
+# How aggressively to poll while inside the monitoring window.
 # workers * interval determines effective request rate. 3 workers every 2s
 # ≈ one request every ~0.67s, which is plenty without being abusive.
 poll_workers: 3
 poll_interval_seconds: 2.0
 http_timeout_seconds: 10.0
 
-# File where already-alerted thread URLs and product keys are recorded so the
+# File where already-alerted (thread_url, cigar) pairs are recorded so the
 # script never double-sends. Safe to delete to reset state.
 dedup_state_path: ".state/seen.txt"
