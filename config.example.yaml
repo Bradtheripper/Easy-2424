@@ -1,0 +1,26 @@
+# Copy to config.yaml and fill in real values. config.yaml is gitignored.
+
+smtp:
+  host: smtp.gmail.com
+  port: 465            # 465 = SSL (recommended for Gmail); use 587 with use_ssl=false for STARTTLS
+  use_ssl: true
+  user: "you@gmail.com"
+  # Gmail App Password (16 chars, no spaces). See:
+  # https://support.google.com/accounts/answer/185833
+  password: "your-16-char-app-password"
+  sender_name: "FOHC 24:24 Monitor"
+
+# One or more destination inboxes.
+recipients:
+  - "target@example.com"
+
+# How aggressively to poll while inside the 08:27-08:32 Beijing-time window.
+# workers * interval determines effective request rate. 3 workers every 2s
+# ≈ one request every ~0.67s, which is plenty without being abusive.
+poll_workers: 3
+poll_interval_seconds: 2.0
+http_timeout_seconds: 10.0
+
+# File where already-alerted thread URLs and product keys are recorded so the
+# script never double-sends. Safe to delete to reset state.
+dedup_state_path: ".state/seen.txt"
