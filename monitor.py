@@ -73,6 +73,11 @@ WINDOWS = {
 HTTP_PREWARM_SECONDS = 30   # fetch forum once to warm TCP/TLS + probe RSS
 SMTP_PREWARM_SECONDS = 10   # open Gmail SMTP + AUTH LOGIN so first send is instant
 
+# How many RSS fetches in a row may fail before we permanently flip to HTML
+# for the rest of the current window. Prevents a dead CDN cache-shard from
+# eating the whole 5 minutes.
+RSS_FAIL_THRESHOLD = 3
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -105,11 +110,12 @@ class AppConfig:
     body_template: str
     cigars: List[str]
     # Tightened defaults for high-traffic windows: 6 workers staggered across a
-    # 1s interval (~167ms effective rate) and a 3s per-request timeout with one
-    # fast retry so a stuck request doesn't eat the window.
+    # 1s interval (~167ms effective rate). Per-request timeout is 8s — raised
+    # from 3s after a real drop showed Cloudflare+origin easily crossing 5s
+    # under load, which caused every single poll to give up.
     poll_workers: int = 6
     poll_interval_seconds: float = 1.0
-    http_timeout_seconds: float = 3.0
+    http_timeout_seconds: float = 8.0
     dedup_state_path: Path = field(default_factory=lambda: Path(".state/seen.txt"))
 
 
@@ -182,7 +188,12 @@ def title_matches(title: str, keyword: str) -> bool:
 
 class ForumScraper:
     """Fetches the forum index. Prefers the RSS feed (lighter, faster) when
-    the endpoint is reachable; falls back to parsing the HTML page."""
+    the endpoint is reachable; falls back to parsing the HTML page.
+
+    All real fetches append a ``?_=<ts>_<n>`` cache-buster so Cloudflare's
+    edge cache can't serve us a stale feed during the drop window (the
+    observed failure mode on 2026-04-15's Wednesday drop).
+    """
 
     def __init__(self, config: AppConfig) -> None:
         self.session = requests.Session()
@@ -201,13 +212,34 @@ class ForumScraper:
         self.timeout = config.http_timeout_seconds
         # None = not yet probed; True/False after warm_up() / first RSS attempt.
         self._rss_works: Optional[bool] = None
+        # In-window RSS health tracking. Reset on each window open.
+        self._rss_consecutive_fails: int = 0
+        self._use_html_override: bool = False
+        self._req_counter: int = 0
+
+    # ---- lifecycle ------------------------------------------------------
+
+    def reset_window_state(self) -> None:
+        """Clear in-window RSS health counters. Called at each window open
+        so an HTML-override from a previous window doesn't stick."""
+        self._rss_consecutive_fails = 0
+        self._use_html_override = False
+
+    def _bust(self, url: str) -> str:
+        """Append a unique cache-buster query parameter so Cloudflare can't
+        serve us a cached copy. Millisecond ts + per-scraper counter keeps
+        URLs unique even across workers in the same millisecond."""
+        self._req_counter += 1
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}_={int(time.time() * 1000)}{self._req_counter}"
 
     # ---- low-level fetch ------------------------------------------------
 
-    def fetch(self, url: str) -> Optional[str]:
-        """GET with one fast retry on network error; 3s-style timeout."""
+    def fetch(self, url: str, retries: int = 2) -> Optional[str]:
+        """GET with up to `retries` retries on network error."""
         last_exc: Optional[Exception] = None
-        for attempt in range(2):
+        attempts = max(1, retries + 1)
+        for attempt in range(attempts):
             try:
                 r = self.session.get(url, timeout=self.timeout)
             except (requests.RequestException, socket.timeout) as exc:
@@ -217,7 +249,9 @@ class ForumScraper:
                 return r.text
             LOGGER.warning("GET %s -> HTTP %s", url, r.status_code)
             return None
-        LOGGER.warning("GET %s failed after retry: %s", url, last_exc)
+        LOGGER.warning(
+            "GET %s failed after %d attempts: %s", url, attempts, last_exc
+        )
         return None
 
     # ---- warm-up / RSS probing -----------------------------------------
@@ -233,7 +267,7 @@ class ForumScraper:
 
     def _probe_rss(self) -> bool:
         try:
-            r = self.session.get(RSS_URL, timeout=self.timeout)
+            r = self.session.get(self._bust(RSS_URL), timeout=self.timeout)
         except (requests.RequestException, socket.timeout) as exc:
             LOGGER.info("RSS probe: network error (%s); using HTML fallback", exc)
             self._rss_works = False
@@ -262,27 +296,53 @@ class ForumScraper:
         """Return current thread list using the preferred source.
 
         A cheap substring pre-filter on the raw response skips full parsing
-        when no "24:24" appears anywhere on the page — which is ~99.9% of
-        polls.
+        when no "24:24" appears anywhere — which is ~99.9% of polls. DEBUG
+        logging emits one line per poll showing bytes and pre-filter result
+        so silent "no match" isn't opaque in the logs.
         """
         if self._rss_works is None:
             # First call without explicit warm-up: probe lazily.
             self._probe_rss()
 
-        if self._rss_works:
-            body = self.fetch(RSS_URL)
-            if not body:
-                return []
-            if "24:24" not in body and "24\uff1a24" not in body:
-                return []
-            return self._parse_rss(body)
+        use_rss = bool(self._rss_works) and not self._use_html_override
 
-        body = self.fetch(FORUM_URL)
+        if use_rss:
+            body = self.fetch(self._bust(RSS_URL))
+            if not body:
+                self._rss_consecutive_fails += 1
+                if (self._rss_consecutive_fails >= RSS_FAIL_THRESHOLD
+                        and not self._use_html_override):
+                    LOGGER.warning(
+                        "RSS failed %d times in a row; switching to HTML "
+                        "for the rest of this window",
+                        self._rss_consecutive_fails,
+                    )
+                    self._use_html_override = True
+                return []
+            # RSS actually returned something — reset the window-fail counter.
+            self._rss_consecutive_fails = 0
+            has_match = "24:24" in body or "24\uff1a24" in body
+            LOGGER.debug(
+                "RSS %d bytes; 24:24_in_body=%s", len(body), has_match
+            )
+            if not has_match:
+                return []
+            threads = self._parse_rss(body)
+            LOGGER.debug("RSS parsed %d threads", len(threads))
+            return threads
+
+        body = self.fetch(self._bust(FORUM_URL))
         if not body:
             return []
-        if "24:24" not in body and "24\uff1a24" not in body:
+        has_match = "24:24" in body or "24\uff1a24" in body
+        LOGGER.debug(
+            "HTML %d bytes; 24:24_in_body=%s", len(body), has_match
+        )
+        if not has_match:
             return []
-        return self._parse_html(body)
+        threads = self._parse_html(body)
+        LOGGER.debug("HTML parsed %d threads", len(threads))
+        return threads
 
     # ---- parsers --------------------------------------------------------
 
@@ -573,7 +633,12 @@ class Monitor:
         if not keyword:
             return
         threads = self.scraper.list_threads()
-        LOGGER.debug("[w%d] fetched %d threads", worker_id, len(threads))
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            matched = sum(1 for t in threads if title_matches(t.title, keyword))
+            LOGGER.debug(
+                "[w%d] fetched=%d matched=%d keyword=%s",
+                worker_id, len(threads), matched, keyword,
+            )
         for t in threads:
             if not title_matches(t.title, keyword):
                 continue
@@ -678,6 +743,9 @@ class Monitor:
     def run_window(self) -> None:
         LOGGER.info("Entering monitor window at %s", beijing_now())
         self.all_sent_event.clear()
+        # Reset in-window RSS health tracking so a previous window's
+        # HTML-override doesn't carry over.
+        self.scraper.reset_window_state()
         workers = max(1, self.cfg.poll_workers)
         stagger = self.cfg.poll_interval_seconds / workers
         window_start = self._window_start_monotonic()
@@ -785,7 +853,7 @@ def load_config(path: Path) -> AppConfig:
         cigars=list(cigars),
         poll_workers=int(data.get("poll_workers", 6)),
         poll_interval_seconds=float(data.get("poll_interval_seconds", 1.0)),
-        http_timeout_seconds=float(data.get("http_timeout_seconds", 3.0)),
+        http_timeout_seconds=float(data.get("http_timeout_seconds", 8.0)),
         dedup_state_path=state_path,
     )
 

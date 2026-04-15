@@ -84,7 +84,8 @@ After=network-online.target
 Type=simple
 User=fohc
 WorkingDirectory=/opt/fohc24
-ExecStart=/opt/fohc24/.venv/bin/python /opt/fohc24/monitor.py
+ExecStart=/opt/fohc24/.venv/bin/python /opt/fohc24/monitor.py -v
+Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=5
 

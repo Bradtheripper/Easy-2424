@@ -58,10 +58,14 @@ cigars:
 # The scraper pre-warms TCP/TLS at T-30s and SMTP login at T-10s before the
 # window opens, so the first in-window request skips handshakes. A raw-text
 # "24:24" substring pre-filter also skips BeautifulSoup parsing on the 99.9%
-# of polls that don't match.
+# of polls that don't match. Every fetch appends a `?_=<ts>` cache-buster
+# so Cloudflare can't serve a stale RSS snapshot during the drop.
+# http_timeout_seconds was 3.0 originally; 2026-04-15's Wed drop saw the
+# site routinely take 5-7s under load, so the timeout is now 8s with
+# automatic RSS→HTML fallback if RSS fails 3 polls in a row.
 poll_workers: 6
 poll_interval_seconds: 1.0
-http_timeout_seconds: 3.0
+http_timeout_seconds: 8.0
 
 # File where already-alerted (thread_url, cigar) pairs are recorded so the
 # script never double-sends. Safe to delete to reset state.
